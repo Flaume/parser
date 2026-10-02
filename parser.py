@@ -1,0 +1,913 @@
+import asyncio
+import html
+import ipaddress
+import re
+import socket
+import time
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+
+import logging
+
+import aiohttp
+from selectolax.parser import HTMLParser
+
+import analysis
+import contacts as cn
+import geoapify
+import google_places
+import niches
+from config import (
+    GEOAPIFY_API_KEY,
+    GOOGLE_MAX_PAGES,
+    GOOGLE_PLACES_API_KEY,
+    NOMINATIM_URL,
+    OVERPASS_URL,
+    USER_AGENT,
+)
+from lead_identity import LeadIdentityIndex, claim_tokens
+
+log = logging.getLogger("parser_cc.search")
+
+OVERPASS_FALLBACK_URLS = (
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+)
+
+NICHES = niches.NICHES
+FREE_HOSTS = analysis.FREE_HOSTS
+
+_nominatim_lock = asyncio.Lock()
+_last_nominatim_request = 0.0
+_geocode_cache: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+
+
+class GeoError(Exception):
+    pass
+
+
+class PublicResolver(aiohttp.abc.AbstractResolver):
+    """Resolve only public IP addresses and return those exact answers to aiohttp."""
+
+    def __init__(self):
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        records = await self._resolver.resolve(host, port, family)
+        if not records:
+            raise OSError("The host did not resolve to an IP address.")
+        for record in records:
+            address = ipaddress.ip_address(record["host"])
+            if not address.is_global:
+                raise OSError("Private or reserved network addresses are blocked.")
+        return records
+
+    async def close(self):
+        await self._resolver.close()
+
+
+async def geocode(
+    session: aiohttp.ClientSession, city: str, country: str
+) -> tuple[float, float, float, float]:
+    global _last_nominatim_request
+    cache_key = (city.strip().casefold(), country.lower())
+    if cache_key in _geocode_cache:
+        return _geocode_cache[cache_key]
+
+    # Nominatim asks applications to keep aggregate traffic at or below 1 r/s.
+    async with _nominatim_lock:
+        if cache_key in _geocode_cache:
+            return _geocode_cache[cache_key]
+        wait = 1.1 - (time.monotonic() - _last_nominatim_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_nominatim_request = time.monotonic()
+        try:
+            async with session.get(
+                NOMINATIM_URL,
+                params={
+                    "q": city.strip(),
+                    "countrycodes": country.lower(),
+                    "format": "json",
+                    "limit": 1,
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as response:
+                if response.status != 200:
+                    raise GeoError(f"Геокодер вернул HTTP {response.status}")
+                data = await response.json(content_type=None)
+        except asyncio.TimeoutError as exc:
+            raise GeoError("Геокодер не ответил вовремя. Попробуйте позже.") from exc
+        except aiohttp.ClientError as exc:
+            raise GeoError("Не удалось связаться с геокодером.") from exc
+
+    if not data:
+        raise GeoError(f"Город «{city}» не найден в стране {country.upper()}.")
+    try:
+        box = data[0]["boundingbox"]  # south, north, west, east
+        result = (float(box[0]), float(box[2]), float(box[1]), float(box[3]))
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise GeoError("Геокодер вернул неполные координаты.") from exc
+    _geocode_cache[cache_key] = result
+    return result
+
+
+def custom_term(custom: str) -> str:
+    """Своя ниша: оставляем только буквы, цифры и пробелы, чтобы запрос был безопасным."""
+    cleaned = re.sub(r"[^\w\s]", " ", custom.strip()[:80], flags=re.U).replace("_", " ")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def build_query(
+    bbox: tuple[float, float, float, float] | None,
+    niche: int,
+    custom: str,
+    *,
+    country: str = "",
+    result_limit: int | None = None,
+) -> str:
+    country_area = bbox is None
+    if country_area:
+        country_code = country.upper()
+        if not re.fullmatch(r"[A-Z]{2}", country_code):
+            raise GeoError("Для поиска по стране нужен двухбуквенный код страны.")
+        location = "(area.searchArea)"
+        area_prelude = (
+            f'area["ISO3166-1"="{country_code}"][admin_level=2]->.searchArea;\n'
+        )
+    else:
+        south, west, north, east = bbox
+        location = f"({south},{west},{north},{east})"
+        area_prelude = ""
+    clauses = []
+    business = f'[~"^({niches.BUSINESS_KEYS})$"~"."]'
+    if niche == niches.CUSTOM and custom.strip():
+        term = custom_term(custom)
+        if not term:
+            raise GeoError("Слово для поиска должно содержать буквы или цифры.")
+        clauses.append(f'nwr["name"~"{term}",i]{business}{location};')
+    else:
+        spec = niches.get(niche)
+        for flt in spec["osm"]:
+            clauses.append(f"nwr{flt}{location};")
+        if spec.get("name"):
+            clauses.append(f'nwr["name"~"{spec["name"]}",i]{business}{location};')
+    output = "out center tags;"
+    if result_limit:
+        output = f"out center tags {max(1, min(int(result_limit), 1500))};"
+    return (
+        "[out:json][timeout:90];\n"
+        + area_prelude
+        + "(\n"
+        + "\n".join(clauses)
+        + "\n);"
+        + output
+    )
+
+
+async def overpass(session: aiohttp.ClientSession, query: str) -> list[dict]:
+    endpoints = list(dict.fromkeys((OVERPASS_URL, *OVERPASS_FALLBACK_URLS)))
+    last_status = None
+    timed_out = False
+    for endpoint in endpoints:
+        try:
+            async with session.post(
+                endpoint,
+                data={"data": query},
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                if response.status != 200:
+                    last_status = response.status
+                    if response.status in (406, 429) or response.status >= 500:
+                        continue
+                    raise GeoError(
+                        f"OpenStreetMap Overpass вернул HTTP {response.status}. "
+                        "Проверьте параметры поиска."
+                    )
+                try:
+                    data = await response.json(content_type=None)
+                except (aiohttp.ClientError, ValueError):
+                    continue
+                if isinstance(data, dict) and isinstance(data.get("elements", []), list):
+                    return data.get("elements", [])
+        except asyncio.TimeoutError:
+            timed_out = True
+        except aiohttp.ClientError:
+            continue
+
+    if last_status is not None:
+        raise GeoError(
+            "Сервис поиска OpenStreetMap временно недоступен "
+            f"(HTTP {last_status} на последнем сервере). Попробуйте позже."
+        )
+    if timed_out:
+        raise GeoError("Поиск OpenStreetMap занял слишком много времени. Попробуйте позже.")
+    raise GeoError("Не удалось получить корректный ответ от OpenStreetMap Overpass.")
+
+
+def extract_contacts(tags: dict, country: str = "") -> dict:
+    contacts = {}
+    tg = cn.telegram(tags.get("contact:telegram") or tags.get("telegram"))
+    if tg:
+        contacts["tg"] = tg
+    vk = cn.vk(tags.get("contact:vk") or tags.get("vk"))
+    if vk:
+        contacts["vkg" if vk.startswith(("club", "public", "event")) else "vk"] = vk
+    wa = cn.whatsapp(tags.get("contact:whatsapp") or tags.get("whatsapp"), country)
+    if wa:
+        contacts["wa"] = wa
+    vb = cn.viber(tags.get("contact:viber") or tags.get("viber"), country)
+    if vb:
+        contacts["vb"] = vb
+    mail = cn.email(tags.get("contact:email") or tags.get("email"))
+    if mail:
+        contacts["email"] = mail
+    ig = cn.instagram(tags.get("contact:instagram") or tags.get("instagram"))
+    if ig:
+        contacts["ig"] = ig
+    fb = cn.facebook(tags.get("contact:facebook") or tags.get("facebook"))
+    if fb:
+        contacts["fb"] = fb
+
+    street = " ".join(
+        part for part in (
+            tags.get("addr:street", "").strip(),
+            tags.get("addr:housenumber", "").strip(),
+        ) if part
+    )
+    locality = tags.get("addr:postcode", "").strip()
+    if street:
+        contacts["address"] = ", ".join(part for part in (street, locality) if part)
+    return contacts
+
+
+def normalize_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw or raw.lower() in ("no", "none", "-"):
+        return ""
+    if not re.match(r"^https?://", raw, re.I):
+        raw = "http://" + raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or "." not in parsed.hostname
+    ):
+        return ""
+    try:
+        if parsed.port not in (None, 80, 443):
+            return ""
+        ascii_host = parsed.hostname.encode("idna").decode("ascii")
+    except ValueError:
+        return ""
+    except UnicodeError:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", ascii_host):
+        return ""
+    netloc = ascii_host
+    if parsed.port:
+        netloc += ":" + str(parsed.port)
+    return urlunsplit(
+        (parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, parsed.fragment)
+    )
+
+
+class DNSFailure(Exception):
+    pass
+
+
+async def _public_address(hostname: str) -> bool:
+    try:
+        literal = ipaddress.ip_address(hostname)
+        return literal.is_global
+    except ValueError:
+        pass
+
+    try:
+        loop = asyncio.get_running_loop()
+        records = await loop.getaddrinfo(
+            hostname, None, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
+    except socket.gaierror as exc:
+        raise DNSFailure(hostname) from exc
+    except (OSError, asyncio.TimeoutError):
+        return False
+    addresses = set()
+    for record in records:
+        try:
+            addresses.add(ipaddress.ip_address(record[4][0]))
+        except ValueError:
+            return False
+    # Reject a hostname if any DNS answer points to a local/reserved address.
+    return bool(addresses) and all(address.is_global for address in addresses)
+
+
+async def _checked_url(url: str) -> str | None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    try:
+        if parsed.port not in (None, 80, 443):
+            return None
+    except ValueError:
+        return None
+    if not await _public_address(parsed.hostname):
+        return None
+    return url
+
+
+async def _fetch_public_page(
+    session: aiohttp.ClientSession, start_url: str
+) -> tuple[int, str, str, str]:
+    url = start_url
+    for _ in range(6):
+        safe_url = await _checked_url(url)
+        if not safe_url:
+            raise ValueError("Сайт ведёт на непубличный или недопустимый адрес.")
+        async with session.get(
+            safe_url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=12),
+            allow_redirects=False,
+        ) as response:
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    return response.status, "", str(response.url), ""
+                url = urljoin(str(response.url), location)
+                continue
+            raw_body = await response.content.read(220_000)
+            try:
+                encoding = response.charset or "utf-8"
+                body = raw_body.decode(encoding, "ignore")
+            except LookupError:
+                body = raw_body.decode("utf-8", "ignore")
+            return (
+                response.status,
+                body,
+                str(response.url),
+                response.headers.get("Last-Modified", ""),
+            )
+    raise ValueError("Слишком много перенаправлений.")
+
+
+def extract_site_contacts(body: str, page_url: str, country: str = "") -> dict:
+    """Collect contact links that a business itself publishes on its home page."""
+    result = {}
+    tree = HTMLParser(body)
+
+    for anchor in tree.css("a[href]"):
+        href = html.unescape((anchor.attributes.get("href") or "").strip())
+        lowered = href.lower()
+        if lowered.startswith("mailto:"):
+            address = cn.email(unquote(href[7:].split("?", 1)[0]))
+            if address:
+                result.setdefault("email", address)
+            continue
+        if lowered.startswith("tel:"):
+            number = unquote(href[4:]).split(";", 1)[0].strip()
+            if cn.phone(number, country)[0]:
+                result.setdefault("phone", number)
+            continue
+        if lowered.startswith("viber://"):
+            number = cn.viber(href, country)
+            if number:
+                result.setdefault("vb", number)
+            continue
+        if not lowered.startswith(("http://", "https://", "//")):
+            continue
+        try:
+            absolute = urljoin(page_url, href)
+            host = (urlsplit(absolute).hostname or "").lower()
+        except ValueError:
+            continue
+        if host.startswith("www."):
+            host = host[4:]
+        if host in {"t.me", "telegram.me", "telegram.dog"}:
+            value = cn.telegram(absolute)
+            if value:
+                result.setdefault("tg", value)
+        elif host in {"wa.me", "api.whatsapp.com", "whatsapp.com"}:
+            value = cn.whatsapp(absolute, country)
+            if value:
+                result.setdefault("wa", value)
+        elif host in {"vk.com", "m.vk.com", "vk.ru", "m.vk.ru"}:
+            value = cn.vk(absolute)
+            if value and "vk" not in result and "vkg" not in result:
+                result["vkg" if value.startswith(("club", "public", "event")) else "vk"] = value
+        elif host in {"instagram.com", "m.instagram.com", "instagr.am"}:
+            value = cn.instagram(absolute)
+            if value:
+                result.setdefault("ig", value)
+        elif host in {"facebook.com", "m.facebook.com", "fb.com"}:
+            value = cn.facebook(absolute)
+            if value:
+                result.setdefault("fb", value)
+
+    if "email" not in result:
+        text = html.unescape(tree.text()[:50000] if tree.body else "")
+        address = cn.email(text)
+        if address:
+            result["email"] = address
+    return result
+
+
+# HTTP-ответы, которые чаще всего означают защиту от ботов, а не сломанный сайт.
+UNVERIFIABLE_STATUSES = {401, 403, 405, 406, 409, 425, 429, 451, 503}
+
+
+async def analyze_site(session: aiohttp.ClientSession, url: str, country: str = "") -> dict:
+    """Открывает сайт и проверяет его. Результат:
+    status: ok | weak | broken | unknown (unknown = не удалось проверить честно)."""
+    result = {
+        "status": "unknown", "final_url": url, "reasons": [], "contacts": {}, "checks": {},
+    }
+    started = time.perf_counter()
+    try:
+        status, body, final_url, last_modified = await _fetch_public_page(session, url)
+    except DNSFailure:
+        result.update(status="broken", final_url="", reasons=["домен сайта не существует или не настроен"])
+        return result
+    except asyncio.TimeoutError:
+        result["reasons"] = ["сайт не ответил вовремя — не удалось проверить"]
+        return result
+    except ValueError:
+        result.update(status="broken", final_url="", reasons=["адрес сайта недоступен"])
+        return result
+    except aiohttp.ClientSSLError:
+        result.update(status="broken", reasons=["ошибка сертификата HTTPS — браузер покажет предупреждение"])
+        return result
+    except aiohttp.ClientConnectorError:
+        result.update(status="broken", reasons=["сайт не открывается (сервер не отвечает)"])
+        return result
+    except (aiohttp.ClientError, OSError):
+        result["reasons"] = ["соединение с сайтом оборвалось — не удалось проверить"]
+        return result
+
+    elapsed = time.perf_counter() - started
+    result["final_url"] = final_url
+    if status in UNVERIFIABLE_STATUSES:
+        result["reasons"] = [f"сайт ограничивает автоматическую проверку (HTTP {status})"]
+        return result
+    if status >= 400:
+        result.update(status="broken", reasons=[f"сайт отдаёт ошибку {status}"])
+        return result
+
+    checks = analysis.inspect_page(body, final_url, elapsed, last_modified)
+    page_contacts = extract_site_contacts(body, final_url, country)
+    has_reach = page_contacts.get("phone") or any(
+        page_contacts.get(key) for key in ("tg", "wa", "vk", "vkg", "ig")
+    )
+    if not has_reach:
+        contact_url = analysis.contact_page_url(checks["links"], final_url)
+        if contact_url:
+            try:
+                c_status, c_body, c_final, _ = await _fetch_public_page(session, contact_url)
+                if c_status < 400:
+                    extra = extract_site_contacts(c_body, c_final, country)
+                    for key, value in extra.items():
+                        page_contacts.setdefault(key, value)
+                    extra_checks = analysis.inspect_page(c_body, c_final, 0)
+                    for key in ("tg", "tg_bot", "booking"):
+                        if not checks[key] and extra_checks[key]:
+                            checks[key] = extra_checks[key]
+                    if not checks["form"] and extra_checks["form"]:
+                        checks["form"] = True
+                    checks["contact_page"] = c_final
+            except (DNSFailure, ValueError, asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                pass
+    problems = [
+        problem for problem in checks["problems"]
+        if not (problem == "на сайте не видно контактов" and (page_contacts or checks.get("contact_page")))
+        and not (problem.startswith("нет онлайн-записи") and checks["booking"])
+    ]
+    checks.pop("links", None)
+    checks["problems"] = problems
+    if checks["tg_bot"]:
+        page_contacts.setdefault("tg_bot", checks["tg_bot"])
+    result.update(
+        status="weak" if problems else "ok",
+        reasons=problems,
+        contacts=page_contacts,
+        checks=checks,
+    )
+    return result
+
+
+async def check_site(
+    session: aiohttp.ClientSession, url: str, country: str = ""
+) -> tuple[list[str], str, dict]:
+    """Старый формат ответа (причины, итоговый адрес, контакты) — для совместимости."""
+    found = await analyze_site(session, url, country)
+    contacts = dict(found["contacts"])
+    contacts.pop("tg_bot", None)
+    reasons = found["reasons"] or ([] if found["status"] == "ok" else ["не удалось проверить"])
+    return reasons, found["final_url"], contacts
+
+
+def hot_score(site: str, reasons: list[str], phone: str, contacts: dict) -> int:
+    lead = {"site": site, "reasons": reasons, "phone": phone, "contacts": contacts,
+            "need": analysis.classify(site, reasons, False), "info": {}}
+    return analysis.priority(lead)[0]
+
+
+CLOSED_KEY_PREFIXES = ("disused:", "abandoned:", "was:", "demolished:", "removed:")
+
+
+def _osm_is_closed(tags: dict) -> bool:
+    if any(key.startswith(CLOSED_KEY_PREFIXES) for key in tags):
+        return True
+    if tags.get("shop") == "vacant" or tags.get("end_date"):
+        return True
+    hours = str(tags.get("opening_hours") or "").strip().lower()
+    return hours in ("closed", "off")
+
+
+def _osm_phone_raw(tags: dict) -> str:
+    return (
+        tags.get("phone")
+        or tags.get("contact:phone")
+        or tags.get("contact:mobile")
+        or tags.get("mobile")
+        or ""
+    )
+
+
+def osm_candidate(element: dict, country: str, city: str) -> dict | None:
+    tags = element.get("tags") or {}
+    name = (tags.get("name") or "").strip()
+    if not name or _osm_is_closed(tags):
+        return None
+    lat = element.get("lat", (element.get("center") or {}).get("lat"))
+    lon = element.get("lon", (element.get("center") or {}).get("lon"))
+    found = extract_contacts(tags, country)
+    address = found.pop("address", "")
+    key = f"{element.get('type', 'node')}/{element.get('id', '')}"
+    return {
+        "key": key,
+        "source": "osm",
+        "source_url": f"https://www.openstreetmap.org/{key}",
+        "name": name,
+        "city": tags.get("addr:city") or city,
+        "phone_raw": _osm_phone_raw(tags),
+        "url_raw": tags.get("website") or tags.get("contact:website") or tags.get("url") or "",
+        "address": address,
+        "map": cn.map_link(lat, lon, name, country),
+        "lat": lat,
+        "lon": lon,
+        "tags": tags,
+        "contacts": found,
+        "country": country.upper(),
+        "hours": str(tags.get("opening_hours") or "").strip()[:200],
+    }
+
+
+def _richness(candidate: dict) -> int:
+    score = 0
+    if candidate.get("phone_raw"):
+        score += 10
+    score += 4 * len(candidate.get("contacts") or {})
+    if candidate.get("url_raw"):
+        score += 3
+    return score
+
+
+async def _google_candidates(
+    session: aiohttp.ClientSession,
+    country: str,
+    city: str,
+    niche: int,
+    custom: str,
+    budget,
+) -> list[dict]:
+    where = city or google_places.COUNTRY_NAMES.get(country.upper(), country.upper())
+    found: list[dict] = []
+    seen: set[str] = set()
+    for query in google_places.queries_for(country, niche, custom):
+        places = await google_places.text_search(
+            session,
+            GOOGLE_PLACES_API_KEY,
+            f"{query} {where}".strip(),
+            country,
+            max_pages=GOOGLE_MAX_PAGES,
+            on_request=budget,
+        )
+        for place in places:
+            candidate = google_places.to_candidate(place, country)
+            if candidate and candidate["key"] not in seen:
+                seen.add(candidate["key"])
+                candidate["contacts"] = {}
+                if not candidate["city"]:
+                    candidate["city"] = city
+                found.append(candidate)
+    return found
+
+
+async def _geoapify_candidates(session, country, city, niche, custom, bbox, limit, budget) -> list[dict]:
+    if niche == niches.CUSTOM:
+        return []  # Geoapify ищет по категориям, своя ниша идёт через OpenStreetMap.
+    spec = niches.get(niche)
+    features = await geoapify.search(
+        session, GEOAPIFY_API_KEY, spec["geoapify"], bbox, limit=limit, budget=budget
+    )
+    result = []
+    for feature in features:
+        candidate = geoapify.to_candidate(feature, country, city, spec.get("name_filter", ""))
+        if not candidate:
+            continue
+        found = extract_contacts(candidate["tags"], country)
+        found.pop("address", None)
+        candidate["contacts"] = found
+        result.append(candidate)
+    return result
+
+
+def _source_title(source: str) -> str:
+    return {"osm": "OpenStreetMap", "geoapify": "Geoapify (данные OpenStreetMap)",
+            "google": "Google Maps"}.get(source, source)
+
+
+MODE_SITES = {
+    "none": {"none", "broken"},
+    "weak": {"weak"},
+    "both": {"none", "broken", "weak"},
+    "bot": {"ok"},
+    "all": {"none", "broken", "weak", "ok"},
+}
+
+
+async def _report(callback, *args) -> None:
+    if callback is None:
+        return
+    try:
+        await callback(*args)
+    except Exception:
+        log.exception("Search callback failed")
+
+
+async def run_search(
+    country: str,
+    city: str,
+    niche: int,
+    custom: str,
+    mode: str,
+    count: int,
+    progress=None,
+    exclude_keys: set[str] | None = None,
+    exclude_leads: list[dict] | None = None,
+    google_budget=None,
+    *,
+    exclude_tokens: set[str] | None = None,
+    geo_budget=None,
+    on_source_error=None,
+    on_analyzed=None,
+) -> list[dict]:
+    """Ищет организации. mode: none (нет сайта), weak (слабый сайт), both (нет или слабый),
+    bot (нормальный сайт без бота) или all.
+
+    Источники изолированы: если один не работает, поиск продолжается по остальным.
+    В выдачу попадают только проверенные организации, с которыми можно связаться,
+    которых нет у других пользователей (exclude_tokens) и которые подходят под режим."""
+    country = country.upper()
+    allowed_sites = MODE_SITES.get(mode, MODE_SITES["both"])
+    taken = set() if callable(exclude_tokens) else set(exclude_tokens or ())
+    checked = 0
+    connector = aiohttp.TCPConnector(limit=12, resolver=PublicResolver())
+    timeout = aiohttp.ClientTimeout(total=150)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        city = city.strip()
+        candidates: list[dict] = []
+        failures: list[str] = []
+
+        if GOOGLE_PLACES_API_KEY:
+            try:
+                candidates.extend(
+                    await _google_candidates(session, country, city, niche, custom, google_budget)
+                )
+            except google_places.GoogleError as exc:
+                failures.append("google")
+                log.warning("Google Places: %s", exc)
+                await _report(on_source_error, "google", str(exc))
+
+        def fresh_count() -> int:
+            return sum(1 for item in candidates if not (exclude_keys and item["key"] in exclude_keys))
+
+        need_more = count * 3
+        bbox = None
+        if city:
+            bbox = await geocode(session, city, country)  # город не найден → понятная ошибка
+
+        if fresh_count() < need_more:
+            result_limit = min(1500, max(500, count * 10 + 100))
+            try:
+                query = build_query(bbox, niche, custom, country=country, result_limit=result_limit)
+                elements = await overpass(session, query)
+                osm = [
+                    candidate for candidate in (
+                        osm_candidate(element, country, city) for element in elements
+                    ) if candidate
+                ]
+                osm.sort(key=lambda item: (-_richness(item), -len(item["tags"])))
+                candidates.extend(osm)
+            except GeoError as exc:
+                if niche == niches.CUSTOM and "буквы или цифры" in str(exc):
+                    raise
+                failures.append("osm")
+                log.warning("Overpass: %s", exc)
+                await _report(on_source_error, "osm", str(exc))
+
+        if GEOAPIFY_API_KEY and bbox and fresh_count() < need_more:
+            try:
+                candidates.extend(
+                    await _geoapify_candidates(
+                        session, country, city, niche, custom, bbox,
+                        min(500, max(200, count * 8)), geo_budget,
+                    )
+                )
+            except geoapify.SourceError as exc:
+                failures.append("geoapify")
+                log.warning("Geoapify: %s", exc)
+                await _report(on_source_error, "geoapify", str(exc))
+
+        if not candidates and failures:
+            raise GeoError(
+                "Источники данных сейчас недоступны. Попробуйте через несколько минут."
+            )
+
+        prepared = []
+        for candidate in candidates:
+            if exclude_keys and candidate["key"] in exclude_keys:
+                continue
+            site_url = normalize_url(candidate["url_raw"])
+            e164, pretty = cn.phone(candidate["phone_raw"], country)
+            found_contacts = dict(candidate.get("contacts") or {})
+            if not (e164 or site_url or cn.has_reachable_contact("", found_contacts)):
+                continue
+            identity = {
+                "osm_key": candidate["key"],
+                "name": candidate["name"],
+                "country": country,
+                "city": candidate["city"] or city,
+                "phone": e164,
+                "site_url": site_url,
+                "lat": candidate.get("lat"),
+                "lon": candidate.get("lon"),
+                "contacts": {**found_contacts, "address": candidate["address"]}
+                if candidate["address"] else found_contacts,
+            }
+            prepared.append((candidate, identity, pretty, claim_tokens(identity)))
+
+        # Бизнесы, которые уже выданы кому-то или в чёрном списке, сразу отбрасываем.
+        if callable(exclude_tokens):
+            all_tokens = set().union(*(item[3] for item in prepared)) if prepared else set()
+            taken = await exclude_tokens(all_tokens)
+
+        candidate_index = LeadIdentityIndex(exclude_leads or [])
+        unique_candidates = []
+        candidate_limit = count * 6 + 40
+        for candidate, identity, pretty, tokens in prepared:
+            if taken and tokens & taken:
+                continue
+            if candidate_index.find_duplicate(identity):
+                continue
+            candidate_index.add(identity)
+            unique_candidates.append((candidate, identity, pretty))
+            if len(unique_candidates) >= candidate_limit:
+                break
+
+        semaphore = asyncio.Semaphore(8)
+        telegram = analysis.TelegramChecker(session)
+        results = []
+        result_lock = asyncio.Lock()
+        result_index = LeadIdentityIndex(exclude_leads or [])
+        niche_title = niches.title(niche, custom)
+
+        async def handle(candidate, identity, pretty):
+            nonlocal checked
+            url = identity["site_url"]
+            lead_contacts = dict(identity["contacts"])
+            phone_e164, phone_pretty = identity["phone"], pretty
+            unknown = 0
+
+            async with semaphore:
+                if not url:
+                    site_info = {"status": "none", "final_url": "", "reasons": ["сайта нет"],
+                                 "contacts": {}, "checks": {}}
+                else:
+                    site_info = await analyze_site(session, url, country)
+            site = site_info["status"]
+            if site == "unknown":
+                unknown += 2
+            page_contacts = dict(site_info["contacts"])
+            if not phone_e164 and page_contacts.get("phone"):
+                phone_e164, phone_pretty = cn.phone(page_contacts["phone"], country)
+            page_contacts.pop("phone", None)
+            tg_bot = page_contacts.pop("tg_bot", "")
+            for key, value in page_contacts.items():
+                if key in ("vk", "vkg") and (lead_contacts.get("vk") or lead_contacts.get("vkg")):
+                    continue
+                lead_contacts.setdefault(key, value)
+            if lead_contacts.get("tg") and analysis.is_bot_name(lead_contacts["tg"]):
+                tg_bot = tg_bot or lead_contacts["tg"]
+            if lead_contacts.get("tg"):
+                exists = await telegram.exists(lead_contacts["tg"])
+                if exists is False:
+                    dead = lead_contacts.pop("tg")  # ссылка не открывается — не показываем
+                    if tg_bot and tg_bot.lower() == dead.lower():
+                        tg_bot = ""
+                elif exists is None:
+                    unknown += 1
+            if tg_bot and tg_bot.lower() != str(lead_contacts.get("tg", "")).lower():
+                if await telegram.exists(tg_bot) is False:
+                    tg_bot = ""
+            if candidate.get("map"):
+                lead_contacts["map"] = candidate["map"]
+
+            identity.update(
+                {"phone": phone_e164, "site_url": site_info["final_url"] or url, "contacts": lead_contacts}
+            )
+            checks = site_info.get("checks") or {}
+            info = {
+                "niche": niche_title,
+                "address": candidate.get("address") or "",
+                "hours": candidate.get("hours") or "",
+                "rating": candidate.get("rating"),
+                "reviews": candidate.get("reviews"),
+                "tg_bot": tg_bot,
+                "booking": checks.get("booking", ""),
+                "form": checks.get("form"),
+                "https": checks.get("https"),
+                "mobile": checks.get("mobile"),
+                "speed": checks.get("speed"),
+                "actual": checks.get("actual"),
+                "year": checks.get("year"),
+                "reservation": checks.get("reservation"),
+                "unknown": unknown,
+                "lat": candidate.get("lat"),
+                "lon": candidate.get("lon"),
+                "sources": [
+                    item for item in (
+                        {"t": _source_title(candidate["source"]), "u": candidate.get("source_url") or candidate.get("map") or ""},
+                    ) if item["u"]
+                ],
+            }
+            need = analysis.classify(site, site_info["reasons"], bool(tg_bot))
+            reachable = cn.has_reachable_contact(phone_e164, lead_contacts)
+            lead = {
+                "osm_key": candidate["key"],
+                "name": candidate["name"],
+                "country": country,
+                "city": candidate["city"] or city or "Не указан",
+                "phone": phone_pretty,
+                "phone_e164": phone_e164,
+                "site": site,
+                "site_url": site_info["final_url"] if site in ("weak", "ok", "broken") else "",
+                "reasons": site_info["reasons"],
+                "contacts": lead_contacts,
+                "need": need,
+                "info": info,
+                "source": candidate["source"],
+                "lat": candidate.get("lat"),
+                "lon": candidate.get("lon"),
+            }
+            if site in ("weak", "ok") and site_info["final_url"]:
+                lead_contacts["site"] = site_info["final_url"]
+            lead["hot"], lead["explain"] = analysis.priority(lead)
+
+            async with result_lock:
+                checked += 1
+                verified = unknown < 2 and site != "unknown"
+                if verified and reachable:
+                    await _report(on_analyzed, lead)
+                duplicate = result_index.find_duplicate(identity)
+                if duplicate is None:
+                    result_index.add(identity)
+                keep = site in allowed_sites and bool(need)
+                if duplicate is None and keep and reachable and verified and len(results) < count:
+                    results.append(lead)
+                if progress:
+                    await progress(len(results), checked)
+
+        tasks = [
+            asyncio.create_task(handle(*candidate))
+            for candidate in unique_candidates
+        ]
+        try:
+            for task in asyncio.as_completed(tasks):
+                await task
+                if len(results) >= count:
+                    break
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        output = sorted(results, key=lambda item: -item["hot"])[:count]
+    return output
